@@ -1,0 +1,1 @@
+- 每次代码改动后用户都要求编译运行（npm run tauri dev，后台运行用 bash_start/bash_poll），无需等用户再发"编译运行" <!-- atomcode-memory:v1 {"id":"m-cd08177f-77d6-4a89-92cc-96a5e1264edd","created_at":"2026-10-26T10:44:26.571Z","updated_at":"2026-10-26T10:44:26.571Z","topic":"工作流偏好","status":"active","pinned":false} -->
