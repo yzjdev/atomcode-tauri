@@ -19,11 +19,11 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
-tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.9"
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+# 只用一个 GET，json 特性用不到（响应自己用 serde_json 解析文本）
+reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
 dirs = "6"
 
 
@@ -31,6 +31,7 @@ dirs = "6"
 [profile.release]
 codegen-units = 1
 lto = true
-opt-level = 3
+# 体积优先：opt-level="z" 比 3 更小，这个 GUI 不需要极致性能
+opt-level = "z"
 panic = "abort"
 strip = true

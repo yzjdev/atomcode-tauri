@@ -232,6 +232,29 @@ function CloseIcon({ className }: IconProps) {
   );
 }
 
+function TrashIcon({ className }: IconProps) {
+  return (
+    <svg
+      className={className}
+      width="13"
+      height="13"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M3 6h18" />
+      <path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2" />
+      <path d="m19 6-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+      <path d="M10 11v6" />
+      <path d="M14 11v6" />
+    </svg>
+  );
+}
+
 function CheckIcon({ className }: IconProps) {
   return (
     <svg
@@ -296,6 +319,8 @@ export default function App() {
   const [adding, setAdding] = useState(false);
   // 待确认删除的提供商
   const [deleting, setDeleting] = useState<ProviderAccount | null>(null);
+  // 待确认删除的单个模型
+  const [deletingModel, setDeletingModel] = useState<ModelInfo | null>(null);
 
   const reload = useCallback(async () => {
     try {
@@ -320,13 +345,20 @@ export default function App() {
     removals: string[],
   ) => {
     const lines = configText.split(/\r?\n/);
-    // 删除：移除对应 [models."X"] 段落块（表头带引号/不带引号都能识别）
-    for (const modelId of removals) {
-      const existing = config?.models.find(
-        (m) => m.account === accountName && m.model === modelId,
-      );
-      if (!existing) continue;
-      const start = lines.findIndex((l) => modelHeaderName(l) === existing.name);
+    // 删除：未勾选的已配置模型整体移除对应 [models."X"] 段落。
+    // 匹配同时看 model 字段和段落名，兼容 model 为空或表头名与 id 不一致的配置。
+    const removeKeys = new Set(removals);
+    const targets = new Set(
+      (config?.models ?? [])
+        .filter(
+          (m) =>
+            m.account === accountName &&
+            (removeKeys.has(m.model) || removeKeys.has(m.name)),
+        )
+        .map((m) => m.name),
+    );
+    for (const modelName of targets) {
+      const start = lines.findIndex((l) => modelHeaderName(l) === modelName);
       if (start < 0) continue;
       let end = start + 1;
       while (end < lines.length && !(lines[end].trim().startsWith("[") && lines[end].trim().endsWith("]"))) {
@@ -420,6 +452,29 @@ export default function App() {
     }
 
     await writeConfigText(lines.join("\n"));
+    await reload();
+  };
+
+  /**
+   * 删除单个模型：整体移除对应的 [models."X"] 段落（表头带引号/不带引号都能识别），
+   * 与提供商的归属无关，未归属模型同样可删。
+   */
+  const deleteModel = async (modelName: string) => {
+    const lines = configText.split(/\r?\n/);
+    const start = lines.findIndex((l) => modelHeaderName(l) === modelName);
+    if (start < 0) throw new Error(`配置中找不到模型 ${modelName}`);
+
+    let end = start + 1;
+    while (
+      end < lines.length &&
+      !(lines[end].trim().startsWith("[") && lines[end].trim().endsWith("]"))
+    ) {
+      end++;
+    }
+    lines.splice(start, end - start);
+
+    // 段落移除后可能留下多余空行，最多保留一个空行
+    await writeConfigText(lines.join("\n").replace(/\n{3,}/g, "\n\n"));
     await reload();
   };
 
@@ -655,7 +710,12 @@ export default function App() {
             </div>
             <Collapse open={isOpen}>
               {groupModels.map((m) => (
-                <ModelRows key={m.name} model={m} onUpdateContext={updateModelContext} />
+                <ModelRows
+                  key={m.name}
+                  model={m}
+                  onUpdateContext={updateModelContext}
+                  onDelete={() => setDeletingModel(m)}
+                />
               ))}
             </Collapse>
           </section>
@@ -691,7 +751,12 @@ export default function App() {
           </div>
           <Collapse open={expanded.__orphan ?? false}>
             {orphan.map((m) => (
-              <ModelRows key={m.name} model={m} onUpdateContext={updateModelContext} />
+              <ModelRows
+                key={m.name}
+                model={m}
+                onUpdateContext={updateModelContext}
+                onDelete={() => setDeletingModel(m)}
+              />
             ))}
           </Collapse>
         </section>
@@ -745,10 +810,8 @@ export default function App() {
         <FetchModelsDialog
           account={fetchResult.account}
           remoteModels={fetchResult.models}
-          existingIds={new Set(
-            config.models
-              .filter((m) => m.account === fetchResult.account.name)
-              .map((m) => m.model),
+          existingModels={config.models.filter(
+            (m) => m.account === fetchResult.account.name,
           )}
           onDismiss={() => setFetchResult(null)}
           onApply={applyModelSelection}
@@ -764,6 +827,16 @@ export default function App() {
           onDismiss={() => setDeleting(null)}
           onConfirm={() =>
             deleteProviderAccount(deleting.name).then(() => setDeleting(null))
+          }
+        />
+      )}
+
+      {deletingModel && (
+        <DeleteModelDialog
+          model={deletingModel}
+          onDismiss={() => setDeletingModel(null)}
+          onConfirm={() =>
+            deleteModel(deletingModel.name).then(() => setDeletingModel(null))
           }
         />
       )}
@@ -808,6 +881,56 @@ function DeleteConfirmDialog({
         <h3>删除提供商（{account.name}）？</h3>
         <p className="muted small">
           将同时删除该提供商下的 {modelCount} 个模型，此操作无法撤销。
+        </p>
+        {error && <p className="error-text">{error}</p>}
+        <div className="modal-actions">
+          <button className="btn ghost" onClick={onDismiss}>
+            取消
+          </button>
+          <button className="btn danger" onClick={confirm} disabled={deleting}>
+            {deleting ? "删除中…" : "删除"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** 删除单个模型的确认弹窗：确认后只移除该模型的配置段落 */
+function DeleteModelDialog({
+  model,
+  onDismiss,
+  onConfirm,
+}: {
+  model: ModelInfo;
+  onDismiss: () => void;
+  onConfirm: () => Promise<void>;
+}) {
+  const [deleting, setDeleting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const confirm = async () => {
+    if (deleting) return;
+    setDeleting(true);
+    setError(null);
+    try {
+      await onConfirm();
+      onDismiss();
+    } catch (e) {
+      setError(String(e));
+      setDeleting(false);
+    }
+  };
+
+  return (
+    <div className="modal-backdrop" onClick={onDismiss}>
+      <div
+        className="card modal modal-confirm"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h3>删除模型（{model.name}）？</h3>
+        <p className="muted small">
+          仅移除该模型的配置段落，此操作无法撤销。
         </p>
         {error && <p className="error-text">{error}</p>}
         <div className="modal-actions">
@@ -952,9 +1075,11 @@ function EditAccountDialog({
 function ModelRows({
   model,
   onUpdateContext,
+  onDelete,
 }: {
   model: ModelInfo;
   onUpdateContext: (modelName: string, contextWindow: number) => Promise<void>;
+  onDelete: () => void;
 }) {
   const contextWindow =
     model.contextWindow != null && model.contextWindow > 0
@@ -1050,6 +1175,18 @@ function ModelRows({
           )}
         </span>
         {error && <span className="error-text model-item-error">{error}</span>}
+        <button
+          type="button"
+          className="model-item-del"
+          title="删除该模型"
+          aria-label={`删除模型 ${model.name}`}
+          onClick={(e) => {
+            e.stopPropagation();
+            onDelete();
+          }}
+        >
+          <TrashIcon />
+        </button>
       </div>
       {model.name !== model.model && (
         <span className="model-item-id" title={model.model}>
@@ -1063,13 +1200,13 @@ function ModelRows({
 function FetchModelsDialog({
   account,
   remoteModels,
-  existingIds,
+  existingModels,
   onDismiss,
   onApply,
 }: {
   account: ProviderAccount;
   remoteModels: RemoteModel[];
-  existingIds: Set<string>;
+  existingModels: ModelInfo[];
   onDismiss: () => void;
   onApply: (
     accountName: string,
@@ -1077,6 +1214,32 @@ function FetchModelsDialog({
     removals: string[],
   ) => Promise<void>;
 }) {
+  // 已配置模型的 id：优先取 model 字段，缺失时退回段落名
+  const existingIds = useMemo(
+    () => new Set(existingModels.map((m) => (m.model || m.name).trim())),
+    [existingModels],
+  );
+
+  /**
+   * 展示用行：远端返回的模型 + 已配置但远端未返回的模型。
+   * 后者也列出来（默认勾选），取消勾选同样会删除对应配置。
+   */
+  const rows = useMemo<RemoteModel[]>(() => {
+    const remoteIds = new Set(remoteModels.map((m) => m.id));
+    const missing: RemoteModel[] = existingModels
+      .filter((m) => {
+        const id = (m.model || m.name).trim();
+        return id !== "" && !remoteIds.has(id) && !remoteIds.has(m.name);
+      })
+      .map((m) => ({
+        id: (m.model || m.name).trim(),
+        context_window: m.contextWindow ?? undefined,
+        supports_vision: m.supportsVision ?? undefined,
+        absent_remote: true,
+      }));
+    return [...remoteModels, ...missing];
+  }, [remoteModels, existingModels]);
+
   // 已配置项默认勾选（取消勾选 = 删除）；远端新增默认不勾选（勾选 = 添加）
   const [selected, setSelected] = useState<Set<string>>(new Set(existingIds));
   const [search, setSearch] = useState("");
@@ -1086,7 +1249,7 @@ function FetchModelsDialog({
   const visible = useMemo(
     () =>
       // 已勾选的模型排在前面，其余保持原有字母序（稳定排序）
-      remoteModels
+      rows
         .filter((m) =>
           search.trim() === ""
             ? true
@@ -1095,10 +1258,10 @@ function FetchModelsDialog({
         .sort(
           (a, b) => Number(selected.has(b.id)) - Number(selected.has(a.id)),
         ),
-    [remoteModels, search, selected],
+    [rows, search, selected],
   );
 
-  const additions = remoteModels.filter(
+  const additions = rows.filter(
     (m) => !existingIds.has(m.id) && selected.has(m.id),
   );
   const removals = [...existingIds].filter((id) => !selected.has(id));
@@ -1121,7 +1284,11 @@ function FetchModelsDialog({
       <div className="card modal" onClick={(e) => e.stopPropagation()}>
         <h3>远端模型（{account.name}）</h3>
         <p className="muted small">
-          共 {remoteModels.length} 个远端模型。勾选=添加，取消勾选=删除；当前已有的会默认勾选。
+          共 {remoteModels.length} 个远端模型
+          {rows.length > remoteModels.length
+            ? `，另有 ${rows.length - remoteModels.length} 个已配置但远端未返回`
+            : ""}
+          。勾选=添加，取消勾选=删除；已配置的模型默认勾选。
         </p>
         <div className="search-wrap">
           <svg className="search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
@@ -1139,7 +1306,7 @@ function FetchModelsDialog({
         <div className="model-list">
           {visible.length === 0 && (
             <p className="muted small empty-hint">
-              {remoteModels.length === 0
+              {rows.length === 0
                 ? "远端没有返回任何模型，请检查 base_url 是否正确（接口为 /v1/models）"
                 : "没有匹配的模型，换个关键词试试"}
             </p>
@@ -1176,6 +1343,7 @@ function FetchModelsDialog({
                           ? "支持图文"
                           : "不支持图文"
                         : null,
+                      model.absent_remote ? "远端未返回" : null,
                     ]
                       .filter(Boolean)
                       .join(" · ")}

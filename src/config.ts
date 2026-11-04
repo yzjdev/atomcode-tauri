@@ -28,6 +28,8 @@ export interface RemoteModel {
   id: string;
   context_window?: number;
   supports_vision?: boolean;
+  /** 仅前端使用：该行来自本地配置而远端未返回 */
+  absent_remote?: boolean;
 }
 
 /** 轻量 TOML 子集解析（与 Kotlin 版逻辑一致）：只关心顶层标量、[provider_accounts.X] 与 [models."X"]。 */

@@ -1,6 +1,12 @@
 use serde::Serialize;
 use std::fs;
 use std::path::PathBuf;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+/// Windows：以无控制台方式启动子进程，避免 tasklist/taskkill 闪出黑窗
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// 配置文件路径：~/.atomcode/config.toml
 fn config_path() -> Result<PathBuf, String> {
@@ -40,6 +46,8 @@ pub struct RemoteModel {
 }
 
 /// 拼接远端模型列表地址：兼容 base_url 已带 `/v1` 或已指向 `/models` 的写法。
+/// 特例：opencode 网关的聊天端点为 `{prefix}/openai/v1`，模型列表在 `{prefix}/v1/models`
+///（即去掉路径中的 `/openai` 段再拼 `/v1/models`），不能直接按 `{base}/models` 拼接。
 fn models_url(base_url: &str) -> Result<String, String> {
     let base = base_url.trim().trim_end_matches('/');
     if base.is_empty() {
@@ -47,6 +55,8 @@ fn models_url(base_url: &str) -> Result<String, String> {
     }
     if base.ends_with("/models") {
         Ok(base.to_string())
+    } else if let Some(prefix) = base.strip_suffix("/openai/v1") {
+        Ok(format!("{prefix}v1/models"))
     } else if base.ends_with("/v1") {
         Ok(format!("{base}/models"))
     } else {
@@ -107,6 +117,8 @@ async fn fetch_provider_models(
                 .get("context_window")
                 .or_else(|| item.get("context_length"))
                 .or_else(|| item.get("max_context_tokens"))
+                // opencode 等网关放在 limit.context 里
+                .or_else(|| item.pointer("/limit/context"))
                 .and_then(|v| v.as_u64());
             let supports_vision = item
                 .get("supports_vision")
@@ -126,10 +138,85 @@ async fn fetch_provider_models(
     Ok(models)
 }
 
+/// 启动时结束上一个仍在运行的实例，保证窗口只会出现一个。
+/// 按可执行文件名枚举同名进程（排除当前 PID），逐个强制结束。
+#[cfg(windows)]
+fn kill_previous_instances() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let Some(name) = exe.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
+        return;
+    };
+    let filter = format!("IMAGENAME eq {name}");
+    let Ok(output) = std::process::Command::new("tasklist")
+        .args(["/FI", &filter, "/FO", "CSV", "/NH"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+    else {
+        return;
+    };
+
+    let self_pid = std::process::id();
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    let mut killed = false;
+    for line in text.lines() {
+        // CSV 形如 "atomcode-tauri.exe","12345","Console","1","12,345 K"
+        let pid = line
+            .split(',')
+            .nth(1)
+            .map(|s| s.trim().trim_matches('"'))
+            .and_then(|s| s.parse::<u32>().ok());
+        let Some(pid) = pid else { continue };
+        if pid == self_pid {
+            continue;
+        }
+        let pid_arg = pid.to_string();
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/PID", &pid_arg])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+        killed = true;
+    }
+
+    // 等旧进程真正退出，释放单例资源与端口后再创建新窗口
+    if killed {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+    }
+}
+
+/// 非 Windows 平台：用 pgrep 找同名进程，kill -9 结束（同样排除自身）
+#[cfg(unix)]
+fn kill_previous_instances() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let Some(name) = exe.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    let Ok(output) = std::process::Command::new("pgrep").args(["-x", name]).output() else {
+        return;
+    };
+
+    let self_pid = std::process::id().to_string();
+    for pid in String::from_utf8_lossy(&output.stdout).split_whitespace() {
+        if pid == self_pid {
+            continue;
+        }
+        let _ = std::process::Command::new("kill").args(["-9", pid]).output();
+    }
+}
+
+/// 其它平台暂不处理
+#[cfg(not(any(windows, unix)))]
+fn kill_previous_instances() {}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // 先关掉上一个进程，再启动当前实例，避免同时存在多个窗口
+    kill_previous_instances();
+
     tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             read_config_text,
             write_config_text,

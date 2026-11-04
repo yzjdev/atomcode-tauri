@@ -298,6 +298,35 @@ body {
   flex-shrink: 0;
 }
 
+/* 模型行右侧的删除按钮：平时淡出，悬停该行或聚焦时显现 */
+.model-item-del {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px;
+  flex-shrink: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: #c0c0c6;
+  cursor: pointer;
+  opacity: 0;
+  transition:
+    opacity 0.12s ease,
+    color 0.12s ease,
+    background 0.12s ease;
+}
+
+.model-item:hover .model-item-del,
+.model-item-del:focus-visible {
+  opacity: 1;
+}
+
+.model-item-del:hover {
+  color: var(--error);
+  background: rgba(0, 0, 0, 0.06);
+}
+
 .muted {
   color: var(--muted);
 }
