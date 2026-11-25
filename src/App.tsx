@@ -14,8 +14,12 @@ import {
   type RemoteModel,
   fetchProviderModels,
   formatContextWindow,
+  formatMultiplier,
+  isKnownProtocol,
   parseConfigToml,
+  PROVIDER_PROTOCOLS,
   readConfigText,
+  USER_AGENT_PRESETS,
   writeConfigText,
 } from "./config";
 import "./App.css";
@@ -25,6 +29,36 @@ const HIDDEN_ACCOUNTS = new Set(["builtin", "default", "atomgit"]);
 
 /** 远端未提供上下文窗口时的默认展示值：1M */
 const DEFAULT_CONTEXT_WINDOW = 1_000_000;
+
+/** 积分倍率只来自远端 /v1/models，不写入 config.toml：
+ * 按「账户 + 模型 id」记在 localStorage，重启后模型列表仍能展示。 */
+const MULTIPLIER_CACHE_KEY = "atomcode.creditMultipliers.v1";
+
+const multiplierKey = (account: string, id: string) => `${account}\u0000${id}`;
+
+function loadMultiplierCache(): Record<string, number> {
+  try {
+    const raw = localStorage.getItem(MULTIPLIER_CACHE_KEY);
+    if (!raw) return {};
+    const parsed: unknown = JSON.parse(raw);
+    if (Object.prototype.toString.call(parsed) !== "[object Object]") return {};
+    const out: Record<string, number> = {};
+    for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+      if (typeof v === "number" && Number.isFinite(v)) out[k] = v;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function saveMultiplierCache(map: Record<string, number>) {
+  try {
+    localStorage.setItem(MULTIPLIER_CACHE_KEY, JSON.stringify(map));
+  } catch {
+    // 存储不可用（隐私模式等）时忽略，只影响重启后的展示
+  }
+}
 
 /** 从 [models."X"] / [models.X] / [models.'X'] 表头取出模型名，非模型表头返回 null */
 function modelHeaderName(line: string): string | null {
@@ -50,6 +84,112 @@ function accountHeaderName(line: string): string | null {
 /** 转义 TOML 基本字符串里的反斜杠与双引号，避免模型 ID 含特殊字符时写出坏配置 */
 function escapeTomlString(value: string): string {
   return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+/** 把段落 [start+1, end) 内的 `key = ...` 行替换为新值；不存在时插入到段落末尾。
+ * 旧值是多行数组（reasoning_effort_levels = [ ... ]）时连带删除后续行直到数组结束。 */
+function setTomlField(
+  lines: string[],
+  start: number,
+  end: number,
+  key: string,
+  value: string,
+) {
+  const line = `${key} = ${value}`;
+  const index = lines
+    .slice(start + 1, end)
+    .findIndex((l) => new RegExp(`^\\s*${key}\\s*=`).test(l));
+  if (index < 0) {
+    lines.splice(end, 0, line);
+    return;
+  }
+  const at = start + 1 + index;
+  const old = lines[at];
+  lines[at] = line;
+  const valuePart = old.slice(old.indexOf("=") + 1).trim();
+  if (valuePart.startsWith("[") && !valuePart.endsWith("]")) {
+    let stop = at + 1;
+    while (stop < end && !lines[stop].trim().endsWith("]")) stop++;
+    if (stop < end) lines.splice(at + 1, stop - at);
+  }
+}
+
+/** 删除段落 [start+1, end) 内的 `key = ...` 行（多行数组的续行一并删除）。
+ * 字段不存在时什么都不做。 */
+function removeTomlField(lines: string[], start: number, end: number, key: string) {
+  const index = lines
+    .slice(start + 1, end)
+    .findIndex((l) => new RegExp(`^\\s*${key}\\s*=`).test(l));
+  if (index < 0) return;
+  const at = start + 1 + index;
+  let stop = at + 1;
+  const valuePart = lines[at].slice(lines[at].indexOf("=") + 1).trim();
+  if (valuePart.startsWith("[") && !valuePart.endsWith("]")) {
+    while (stop < end && !lines[stop].trim().endsWith("]")) stop++;
+    if (stop < end) stop++;
+  }
+  lines.splice(at, stop - at);
+}
+
+/** 计算段落边界（不含后续表头，可越过文件尾） */
+function sectionEnd(lines: string[], start: number): number {
+  let end = start + 1;
+  while (
+    end < lines.length &&
+    !(lines[end].trim().startsWith("[") && lines[end].trim().endsWith("]"))
+  ) {
+    end++;
+  }
+  return end;
+}
+
+/** 用远端元数据原位覆盖已配置模型段落：远端数据为准，远端无值时清除本地旧字段。
+ * 每次写入前重算段落边界：多行数组折叠/插入/删除行都会移动后续表头位置。 */
+function syncModelSection(lines: string[], start: number, remote: RemoteModel) {
+  if (remote.context_window != null && remote.context_window > 0) {
+    setTomlField(
+      lines,
+      start,
+      sectionEnd(lines, start),
+      "context_window",
+      String(remote.context_window),
+    );
+  } else {
+    // 远端未提供上下文时写入默认 1M，保证模型始终有可用的上下文配置
+    setTomlField(
+      lines,
+      start,
+      sectionEnd(lines, start),
+      "context_window",
+      String(DEFAULT_CONTEXT_WINDOW),
+    );
+  }
+
+  if (remote.supports_vision != null) {
+    setTomlField(
+      lines,
+      start,
+      sectionEnd(lines, start),
+      "supports_vision",
+      String(remote.supports_vision),
+    );
+  } else {
+    removeTomlField(lines, start, sectionEnd(lines, start), "supports_vision");
+  }
+
+  if (remote.reasoning_effort_levels?.length) {
+    setTomlField(
+      lines,
+      start,
+      sectionEnd(lines, start),
+      "reasoning_effort_levels",
+      `[${remote.reasoning_effort_levels
+        .map((v) => `"${escapeTomlString(v)}"`)
+        .join(", ")}]`,
+    );
+  } else {
+    removeTomlField(lines, start, sectionEnd(lines, start), "reasoning_effort_levels");
+  }
 }
 
 type IconProps = { className?: string };
@@ -321,6 +461,18 @@ export default function App() {
   const [deleting, setDeleting] = useState<ProviderAccount | null>(null);
   // 待确认删除的单个模型
   const [deletingModel, setDeletingModel] = useState<ModelInfo | null>(null);
+  // 远端返回的积分倍率（键：账户 + 模型 id），仅前端展示用
+  const [multipliers, setMultipliers] = useState<Record<string, number>>(
+    loadMultiplierCache,
+  );
+  // 配置文件查看/编辑弹窗
+  const [configEditorOpen, setConfigEditorOpen] = useState(false);
+
+  /** 保存原始配置文本：直接整段写回，再重新解析刷新界面 */
+  const saveConfigText = async (text: string) => {
+    await writeConfigText(text);
+    await reload();
+  };
 
   const reload = useCallback(async () => {
     try {
@@ -338,11 +490,13 @@ export default function App() {
     reload();
   }, [reload]);
 
-  /** 应用模型增删：重写 [models."X"] 段落后整体写回 */
+  /** 应用模型增删：重写 [models."X"] 段落后整体写回。
+   * remote 为本次拉取到的远端列表，用于同步保留模型的元数据。 */
   const applyModelSelection = async (
     accountName: string,
     additions: RemoteModel[],
     removals: string[],
+    remote: RemoteModel[],
   ) => {
     const lines = configText.split(/\r?\n/);
     // 删除：未勾选的已配置模型整体移除对应 [models."X"] 段落。
@@ -366,17 +520,44 @@ export default function App() {
       }
       lines.splice(start, end - start);
     }
-    // 添加：在文件末尾追加新段落，远端返回的元数据一并写入
+    // 保留：已勾选仍在配置里的模型，按远端返回同步元数据（远端有值才改写）
+    const remoteById = new Map(
+      remote.filter((r) => r.id !== "").map((r) => [r.id, r]),
+    );
+    for (const m of (config?.models ?? [])) {
+      if (m.account !== accountName || targets.has(m.name)) continue;
+      const row = remoteById.get((m.model || m.name).trim());
+      if (!row) continue;
+      const start = lines.findIndex((l) => modelHeaderName(l) === m.name);
+      if (start < 0) continue;
+      let end = start + 1;
+      while (
+        end < lines.length &&
+        !(lines[end].trim().startsWith("[") && lines[end].trim().endsWith("]"))
+      ) {
+        end++;
+      }
+      syncModelSection(lines, start, row);
+    }
+    // 添加：在文件末尾追加新段落，远端返回的元数据（含推理档位）一并写入
     let out = lines.join("\n").replace(/\s*$/, "\n");
     for (const m of additions) {
       out += `\n[models."${escapeTomlString(m.id)}"]\n`;
       out += `account = "${escapeTomlString(accountName)}"\n`;
       out += `model = "${escapeTomlString(m.id)}"\n`;
-      if (m.context_window != null && m.context_window > 0) {
-        out += `context_window = ${m.context_window}\n`;
-      }
+      // 远端未提供上下文时写入默认 1M，保证新增模型也有可用上下文
+      out += `context_window = ${
+        m.context_window != null && m.context_window > 0
+          ? m.context_window
+          : DEFAULT_CONTEXT_WINDOW
+      }\n`;
       if (m.supports_vision != null) {
         out += `supports_vision = ${m.supports_vision}\n`;
+      }
+      if (m.reasoning_effort_levels?.length) {
+        out += `reasoning_effort_levels = [${m.reasoning_effort_levels
+          .map((v) => `"${escapeTomlString(v)}"`)
+          .join(", ")}]\n`;
       }
     }
     await writeConfigText(out);
@@ -409,6 +590,9 @@ export default function App() {
       `provider = "${escapeTomlString(next.provider)}"`,
       `base_url = "${escapeTomlString(next.baseUrl)}"`,
       `api_key = "${escapeTomlString(next.apiKey)}"`,
+      ...(next.userAgent
+        ? [`user_agent = "${escapeTomlString(next.userAgent)}"`]
+        : []),
     ];
     if (insertAt >= 0) {
       lines.splice(insertAt, 0, "", ...block);
@@ -441,15 +625,26 @@ export default function App() {
       end++;
     }
 
-    const line = `context_window = ${contextWindow}`;
-    const existing = lines
-      .slice(start + 1, end)
-      .findIndex((l) => /^(\s*)context_window\s*=/.test(l));
-    if (existing >= 0) {
-      lines[start + 1 + existing] = line;
-    } else {
-      lines.splice(end, 0, line);
+    setTomlField(lines, start, end, "context_window", String(contextWindow));
+
+    await writeConfigText(lines.join("\n"));
+    await reload();
+  };
+
+  /** 更新单个模型的视觉能力：写入 [models."X"] 段落的 supports_vision 行。 */
+  const updateModelVision = async (modelName: string, supportsVision: boolean) => {
+    const lines = configText.split(/\r?\n/);
+    const start = lines.findIndex((l) => modelHeaderName(l) === modelName);
+    if (start < 0) throw new Error(`配置中找不到模型 ${modelName}`);
+
+    let end = start + 1;
+    while (
+      end < lines.length &&
+      !(lines[end].trim().startsWith("[") && lines[end].trim().endsWith("]"))
+    ) {
+      end++;
     }
+    setTomlField(lines, start, end, "supports_vision", String(supportsVision));
 
     await writeConfigText(lines.join("\n"));
     await reload();
@@ -501,13 +696,16 @@ export default function App() {
       end++;
     }
 
-    // 重写段落内容，字段顺序保持 名称表头 → provider → base_url → api_key
+    // 重写段落内容，字段顺序保持 名称表头 → provider → base_url → api_key → user_agent
     const header = `[provider_accounts."${escapeTomlString(next.name)}"]`;
     const body = [
       header,
       `provider = "${escapeTomlString(next.provider)}"`,
       `base_url = "${escapeTomlString(next.baseUrl)}"`,
       `api_key = "${escapeTomlString(next.apiKey)}"`,
+      ...(next.userAgent
+        ? [`user_agent = "${escapeTomlString(next.userAgent)}"`]
+        : []),
     ];
     lines.splice(start, end - start, ...body);
 
@@ -604,10 +802,25 @@ export default function App() {
   const toggleAccount = (name: string) =>
     setExpanded((s) => ({ ...s, [name]: !(s[name] ?? false) }));
 
+  /** 取某模型的积分倍率：优先按 model 字段匹配远端 id，缺失时退回段落名 */
+  const rateOf = (account: string, m: ModelInfo): number | undefined =>
+    multipliers[multiplierKey(account, (m.model || m.name).trim())] ??
+    multipliers[multiplierKey(account, m.name)];
+
   return (
     <div className="page">
       <header className="header">
-        <span className="header-label">提供商</span>
+        <span className="header-label">
+          提供商
+          <button
+            className="btn ghost header-config-btn"
+            onClick={() => setConfigEditorOpen(true)}
+            title="查看/编辑原始配置文件 (~/.atomcode/config.toml)"
+          >
+            <EditIcon />
+            查看配置
+          </button>
+        </span>
         <button
           className="btn"
           onClick={() => setAdding(true)}
@@ -656,7 +869,23 @@ export default function App() {
                     setFetching(acc.name);
                     setFetchError(null);
                     fetchProviderModels(acc.baseUrl, acc.apiKey)
-                      .then((models) => setFetchResult({ account: acc, models }))
+                      .then((models) => {
+                        setFetchResult({ account: acc, models });
+                        // 记住本次远端返回的积分倍率，供模型列表展示
+                        setMultipliers((prev) => {
+                          const next = { ...prev };
+                          for (const m of models) {
+                            const key = multiplierKey(acc.name, m.id);
+                            if (m.credit_multiplier != null) {
+                              next[key] = m.credit_multiplier;
+                            } else {
+                              delete next[key];
+                            }
+                          }
+                          saveMultiplierCache(next);
+                          return next;
+                        });
+                      })
                       .catch((e) => {
                         setFetchError(`${acc.name}: ${e}`);
                       })
@@ -713,7 +942,9 @@ export default function App() {
                 <ModelRows
                   key={m.name}
                   model={m}
+                  multiplier={rateOf(acc.name, m)}
                   onUpdateContext={updateModelContext}
+                  onUpdateVision={updateModelVision}
                   onDelete={() => setDeletingModel(m)}
                 />
               ))}
@@ -754,7 +985,9 @@ export default function App() {
               <ModelRows
                 key={m.name}
                 model={m}
+                multiplier={rateOf(m.account, m)}
                 onUpdateContext={updateModelContext}
+                onUpdateVision={updateModelVision}
                 onDelete={() => setDeletingModel(m)}
               />
             ))}
@@ -840,6 +1073,114 @@ export default function App() {
           }
         />
       )}
+
+      {configEditorOpen && (
+        <ConfigEditorDialog
+          text={configText}
+          onDismiss={() => setConfigEditorOpen(false)}
+          onSave={saveConfigText}
+        />
+      )}
+    </div>
+  );
+}
+
+/** 查看 / 编辑原始配置文件。默认只读，点“编辑”后可修改并保存。 */
+function ConfigEditorDialog({
+  text,
+  onDismiss,
+  onSave,
+}: {
+  text: string;
+  onDismiss: () => void;
+  onSave: (text: string) => Promise<void>;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(text);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // 查看模式下，外部配置更新后同步显示（编辑中不覆盖正在输入的内容）
+  useEffect(() => {
+    if (!editing) setDraft(text);
+  }, [text, editing]);
+
+  const dirty = draft !== text;
+
+  const startEdit = () => {
+    setError(null);
+    setEditing(true);
+  };
+  const cancelEdit = () => {
+    setDraft(text);
+    setError(null);
+    setEditing(false);
+  };
+  const save = async () => {
+    if (saving || !dirty) return;
+    setSaving(true);
+    setError(null);
+    try {
+      await onSave(draft);
+      setEditing(false);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="modal-backdrop" onClick={onDismiss}>
+      <div className="card modal modal-wide" onClick={(e) => e.stopPropagation()}>
+        <div className="config-editor-head">
+          <h3>
+            配置文件
+            <span className="config-editor-path">~/.atomcode/config.toml</span>
+          </h3>
+          {editing ? (
+            <button className="btn ghost" onClick={cancelEdit}>
+              取消编辑
+            </button>
+          ) : (
+            <button className="btn ghost" onClick={startEdit}>
+              <EditIcon />
+              编辑
+            </button>
+          )}
+        </div>
+        <textarea
+          className="config-editor-text"
+          value={draft}
+          readOnly={!editing}
+          spellCheck={false}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if ((e.ctrlKey || e.metaKey) && e.key === "s") {
+              e.preventDefault();
+              save();
+            }
+          }}
+        />
+        {error && <p className="error-text">{error}</p>}
+        <p className="muted small">
+          {editing
+            ? "Ctrl+S 保存；保存前会校验 TOML 合法性"
+            : "只读模式，点击“编辑”后可修改配置文件"}
+        </p>
+        <div className="modal-actions">
+          <button className="btn ghost" onClick={onDismiss}>
+            <CloseIcon />
+            关闭
+          </button>
+          {editing && (
+            <button className="btn" onClick={save} disabled={!dirty || saving}>
+              <CheckIcon />
+              {saving ? "保存中…" : "保存"}
+            </button>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
@@ -972,10 +1313,37 @@ function EditAccountDialog({
   onSubmit: (next: ProviderAccount) => Promise<void>;
 }) {
   const isEdit = account != null;
+  const initialProvider = account?.provider ?? "openai-compatible";
   const [name, setName] = useState(account?.name ?? "");
-  const [provider, setProvider] = useState(account?.provider ?? "openai-compatible");
+  const [provider, setProvider] = useState(initialProvider);
+  // 兼容配置中自定义/旧版协议值：不在预设列表里时追加一个选项，避免编辑时丢失原值
+  const protocolOptions = useMemo(
+    () =>
+      isKnownProtocol(initialProvider)
+        ? PROVIDER_PROTOCOLS
+        : [
+            { value: initialProvider, label: `${initialProvider}（自定义）` },
+            ...PROVIDER_PROTOCOLS,
+          ],
+    [initialProvider],
+  );
   const [baseUrl, setBaseUrl] = useState(account?.baseUrl ?? "");
   const [apiKey, setApiKey] = useState(account?.apiKey ?? "");
+  const initialUserAgent = account?.userAgent ?? "";
+  const [userAgent, setUserAgent] = useState(initialUserAgent);
+  // 配置中已有的自定义 UA：追加一个选项，避免编辑时丢失原值
+  const userAgentOptions = useMemo(() => {
+    if (
+      initialUserAgent === "" ||
+      USER_AGENT_PRESETS.some((p) => p.value === initialUserAgent)
+    ) {
+      return USER_AGENT_PRESETS;
+    }
+    return [
+      ...USER_AGENT_PRESETS,
+      { value: initialUserAgent, label: `${initialUserAgent}（自定义）` },
+    ];
+  }, [initialUserAgent]);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
@@ -1000,6 +1368,7 @@ function EditAccountDialog({
         provider: provider.trim(),
         baseUrl: baseUrl.trim(),
         apiKey: apiKey.trim(),
+        userAgent,
       });
     } catch (e) {
       setError(String(e));
@@ -1025,13 +1394,18 @@ function EditAccountDialog({
             {nameError && <span className="error-text">{nameError}</span>}
           </label>
           <label className="form-field">
-            <span className="form-label">类型</span>
-            <input
-              className={`form-input${providerError ? " invalid" : ""}`}
+            <span className="form-label">协议类型</span>
+            <select
+              className={`form-input form-select${providerError ? " invalid" : ""}`}
               value={provider}
               onChange={(e) => setProvider(e.target.value)}
-              placeholder="例如 openai"
-            />
+            >
+              {protocolOptions.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
             {providerError && <span className="error-text">{providerError}</span>}
           </label>
           <label className="form-field">
@@ -1055,6 +1429,23 @@ function EditAccountDialog({
               autoComplete="off"
             />
           </label>
+          <label className="form-field">
+            <span className="form-label">User-Agent</span>
+            <select
+              className="form-input form-select"
+              value={userAgent}
+              onChange={(e) => setUserAgent(e.target.value)}
+            >
+              {userAgentOptions.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
+            <span className="form-hint">
+              部分网关按 Codex UA 放行专用模型；默认不设置则沿用 atomcode 自带 UA
+            </span>
+          </label>
         </div>
         {error && <p className="error-text">{error}</p>}
         <div className="modal-actions">
@@ -1074,11 +1465,16 @@ function EditAccountDialog({
 
 function ModelRows({
   model,
+  multiplier,
   onUpdateContext,
+  onUpdateVision,
   onDelete,
 }: {
   model: ModelInfo;
+  /** 远端返回的积分倍率，无则为 undefined */
+  multiplier?: number;
   onUpdateContext: (modelName: string, contextWindow: number) => Promise<void>;
+  onUpdateVision: (modelName: string, supportsVision: boolean) => Promise<void>;
   onDelete: () => void;
 }) {
   const contextWindow =
@@ -1088,7 +1484,24 @@ function ModelRows({
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
   const [saving, setSaving] = useState(false);
+  const [visionSaving, setVisionSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // 视觉能力缺省（未配置）时按“不支持”展示，点击后置为支持
+  const supportsVision = model.supportsVision ?? false;
+
+  const toggleVision = async () => {
+    if (visionSaving) return;
+    setVisionSaving(true);
+    setError(null);
+    try {
+      await onUpdateVision(model.name, !supportsVision);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setVisionSaving(false);
+    }
+  };
 
   const startEdit = () => {
     setDraft(formatContextWindow(contextWindow));
@@ -1134,16 +1547,30 @@ function ModelRows({
           {model.name}
         </span>
         <span className="model-item-meta">
-          {model.supportsVision != null && (
+          <button
+            type="button"
+            className={`model-item-vision${supportsVision ? " on" : " off"}`}
+            title={
+              supportsVision
+                ? "支持图文，点击切换为不支持"
+                : "不支持图文，点击切换为支持"
+            }
+            aria-label={supportsVision ? "支持图文，点击关闭" : "不支持图文，点击开启"}
+            disabled={visionSaving}
+            onClick={(e) => {
+              e.stopPropagation();
+              toggleVision();
+            }}
+          >
+            {supportsVision ? <VisionIcon /> : <VisionOffIcon />}
+          </button>
+          {/* 积分倍率：来自远端 /v1/models，冷色标签与上下文便签区分 */}
+          {multiplier != null && (
             <span
-              className={`model-item-vision${model.supportsVision ? " on" : " off"}`}
-              title={model.supportsVision ? "支持图文" : "不支持图文"}
+              className="model-item-rate"
+              title={`积分倍率 ${formatMultiplier(multiplier)}`}
             >
-              {model.supportsVision ? (
-                <VisionIcon />
-              ) : (
-                <VisionOffIcon />
-              )}
+              {formatMultiplier(multiplier)}
             </span>
           )}
           {/* 上下文窗口用便签样式突出显示；点击进入编辑 */}
@@ -1212,6 +1639,7 @@ function FetchModelsDialog({
     accountName: string,
     additions: RemoteModel[],
     removals: string[],
+    remoteModels: RemoteModel[],
   ) => Promise<void>;
 }) {
   // 已配置模型的 id：优先取 model 字段，缺失时退回段落名
@@ -1270,7 +1698,7 @@ function FetchModelsDialog({
     setApplying(true);
     setError(null);
     try {
-      await onApply(account.name, additions, removals);
+      await onApply(account.name, additions, removals, remoteModels);
       onDismiss();
     } catch (e) {
       setError(String(e));
@@ -1343,6 +1771,9 @@ function FetchModelsDialog({
                           ? "支持图文"
                           : "不支持图文"
                         : null,
+                      model.credit_multiplier != null
+                        ? `积分倍率 ${formatMultiplier(model.credit_multiplier)}`
+                        : null,
                       model.absent_remote ? "远端未返回" : null,
                     ]
                       .filter(Boolean)
@@ -1372,7 +1803,12 @@ function FetchModelsDialog({
           <button
             className="btn"
             onClick={apply}
-            disabled={(additions.length === 0 && removals.length === 0) || applying}
+            disabled={applying}
+            title={
+              additions.length === 0 && removals.length === 0
+                ? "无增删变更，应用将按远端数据同步已配置模型的上下文/图文/档位"
+                : undefined
+            }
           >
             <CheckIcon />
             {applying ? "应用中…" : "应用更改"}

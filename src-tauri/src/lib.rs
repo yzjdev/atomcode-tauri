@@ -43,6 +43,128 @@ pub struct RemoteModel {
     pub context_window: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supports_vision: Option<bool>,
+    /// 推理档位（reasoning_effort_levels）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort_levels: Option<Vec<String>>,
+    /// 积分倍率：不同网关命名不一，按常见写法尽力解析
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit_multiplier: Option<f64>,
+}
+
+/// 把 JSON 值读成倍率数字，兼容数字与字符串写法：
+/// workbuddy 等网关给 `"x0.11"`（前缀 ×），也接受 `"×0.11"`、`"0.11"`。
+fn as_multiplier(v: &serde_json::Value) -> Option<f64> {
+    if let Some(n) = v.as_f64() {
+        return n.is_finite().then_some(n);
+    }
+    let s = v
+        .as_str()?
+        .trim()
+        .trim_start_matches(['x', 'X', '×'])
+        .trim_end_matches(['x', 'X', '×'])
+        .trim();
+    if s.is_empty() {
+        return None;
+    }
+    s.parse::<f64>().ok().filter(|n| n.is_finite())
+}
+
+/// 提取积分倍率：先试积分相关的具体字段名（workbuddy 用 credits/credits_rate），
+/// 再试嵌套的 pricing/price/billing，最后才是通用 multiplier。
+fn extract_credit_multiplier(item: &serde_json::Value) -> Option<f64> {
+    const KEYS: [&str; 8] = [
+        "credits_rate",
+        "credits_rate_base",
+        "credits",
+        "credit_multiplier",
+        "credits_multiplier",
+        "points_multiplier",
+        "point_multiplier",
+        "credit_ratio",
+    ];
+    for key in KEYS {
+        if let Some(n) = item.get(key).and_then(as_multiplier) {
+            return Some(n);
+        }
+    }
+    for parent in ["pricing", "price", "billing"] {
+        let Some(obj) = item.get(parent) else { continue };
+        for key in KEYS.iter().chain(std::iter::once(&"multiplier")) {
+            if let Some(n) = obj.get(*key).and_then(as_multiplier) {
+                return Some(n);
+            }
+        }
+    }
+    item.get("multiplier").and_then(as_multiplier)
+}
+
+/// 提取上下文窗口 token 数，兼容多种返回写法：
+/// - 数字：`context_window = 1000000`
+/// - 对象：`{"default": 300000, "supported": [300000, 600000, 1000000]}`（取 supported 最大值）
+/// - 回退字段：`context_length`、`max_context_tokens`、`limit.context`
+fn extract_context_window(item: &serde_json::Value) -> Option<u64> {
+    if let Some(v) = item.get("context_window") {
+        if let Some(n) = v.as_u64() {
+            return Some(n);
+        }
+        if let Some(obj) = v.as_object() {
+            let max_supported = obj
+                .get("supported")
+                .and_then(|s| s.as_array())
+                .and_then(|a| a.iter().filter_map(|x| x.as_u64()).max());
+            if let Some(max) = max_supported {
+                return Some(max);
+            }
+            if let Some(d) = obj.get("default").and_then(|d| d.as_u64()) {
+                return Some(d);
+            }
+        }
+    }
+    item.get("context_length")
+        .or_else(|| item.get("max_context_tokens"))
+        // opencode 等网关放在 limit.context 里
+        .or_else(|| item.pointer("/limit/context"))
+        .and_then(|v| v.as_u64())
+}
+
+/// 提取推理档位列表：优先 `reasoning_options` 中 `type = "effort"` 的 values
+///（不含 toggle 型的 off/none），退回 `reasoning_supported_efforts`（过滤 off/none）。
+fn extract_effort_levels(item: &serde_json::Value) -> Option<Vec<String>> {
+    if let Some(options) = item.get("reasoning_options").and_then(|v| v.as_array()) {
+        let mut levels: Vec<String> = Vec::new();
+        for option in options {
+            if option.get("type").and_then(|t| t.as_str()) != Some("effort") {
+                continue;
+            }
+            if let Some(values) = option.get("values").and_then(|v| v.as_array()) {
+                for value in values {
+                    if let Some(s) = value.as_str() {
+                        if !s.is_empty() && !levels.iter().any(|x| x == s) {
+                            levels.push(s.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        if !levels.is_empty() {
+            return Some(levels);
+        }
+    }
+    let levels: Vec<String> = item
+        .get("reasoning_supported_efforts")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .filter(|s| !s.is_empty() && s != "off" && s != "none")
+                .collect()
+        })
+        .unwrap_or_default();
+    if levels.is_empty() {
+        None
+    } else {
+        Some(levels)
+    }
 }
 
 /// 拼接远端模型列表地址：兼容 base_url 已带 `/v1` 或已指向 `/models` 的写法。
@@ -113,21 +235,17 @@ async fn fetch_provider_models(
         .filter_map(|item| {
             let id = item.get("id")?.as_str()?.to_string();
             // 元数据按常见命名做尽力解析，缺失则不展示
-            let context_window = item
-                .get("context_window")
-                .or_else(|| item.get("context_length"))
-                .or_else(|| item.get("max_context_tokens"))
-                // opencode 等网关放在 limit.context 里
-                .or_else(|| item.pointer("/limit/context"))
-                .and_then(|v| v.as_u64());
-            let supports_vision = item
-                .get("supports_vision")
-                .or_else(|| item.get("supports_image_input"))
-                .and_then(|v| v.as_bool());
             Some(RemoteModel {
                 id,
-                context_window,
-                supports_vision,
+                context_window: extract_context_window(&item),
+                supports_vision: item
+                    .get("supports_vision")
+                    .or_else(|| item.get("supports_image_input"))
+                    // workbuddy 等网关用 supports_images 表示图文
+                    .or_else(|| item.get("supports_images"))
+                    .and_then(|v| v.as_bool()),
+                reasoning_effort_levels: extract_effort_levels(&item),
+                credit_multiplier: extract_credit_multiplier(&item),
             })
         })
         .collect();
